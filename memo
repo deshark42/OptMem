@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """OptMem: a permanent, append-only memory for AI agents.
 
-  {memo} init             create this memory; print the setup block.
-  {memo} wake [part [T]]  read your memory. Run first, every session.
-  {memo} note "..."       record one memory: one short line.
+  {memo} init [--memory-dir PATH]  initialize user and global memories.
+  {memo} wake [part]              read user, global, and current workspace.
+  {memo} note --scope SCOPE "..."  record one memory in an explicit scope.
   {memo} nap [id "..."]   do the pending compressions.
   {memo} recall <regex>   search every memory ever recorded.
   {memo} zoom <lo>-<hi>   open a tree node: its two halves.
@@ -11,19 +11,35 @@
   {memo} config [NAME=N]  show this memory's sizes, or change one.
   {memo} import <file>    bulk-load dated memories (bootstrap only).
 
-The memories live in ~/.optmem/memory, or in $MEMORY_DIR if set.
+Scopes: user, global, workspace. note/nap/zoom/forget/import require --scope.
+Workspace defaults to the current directory.
+Use --workspace PATH to override it, --memory-dir PATH to override the root.
+The root is $MEMORY_DIR, the saved init path, or ~/.optmem/memory.
+wake/recall without --scope read only user, global, and the current workspace.
 See github.com/VictorTaelin/OptMem.
 """
 
+import argparse
+import base64
+import contextlib
 import datetime
+import io
+import json
+import hashlib
 try:
     import fcntl
 except ImportError:
     fcntl = None  # Windows has no fcntl; we fall back to msvcrt below
 import os
 import re
+import shlex
+import subprocess
 import sys
+import tempfile
+import weakref
+from urllib.parse import quote
 from collections import deque
+from fractions import Fraction
 
 
 # The store is UTF-8 by construction, so the tool reads and prints UTF-8
@@ -48,12 +64,18 @@ ME = pretty(__file__)
 # what it means. `memo config` shows and edits them. The globals below start
 # at these defaults, so a memory that overrides nothing follows the tool.
 KNOBS = {
-    "WAKE_LINES": (96, "the memory context: how many lines wake prints"),
+    "WAKE_LINES": (96, "total memory-content lines available to wake"),
+    "USER_WAKE_WEIGHT": (1, "user share of the adaptive wake budget"),
+    "GLOBAL_WAKE_WEIGHT": (1, "global share of the adaptive wake budget"),
+    "WORKSPACE_WAKE_WEIGHT": (2, "workspace share of the adaptive wake budget"),
     "ENTRY_CHARS": (280, "the longest one memory may be, in bytes"),
     "PART_CHARS": (20000, "output paging: largest part, in bytes"),
     "PART_LINES": (500, "output paging: largest part, in lines"),
 }
 WAKE_LINES = KNOBS["WAKE_LINES"][0]  # ~8k tokens of dense text, in 2 parts
+USER_WAKE_WEIGHT = KNOBS["USER_WAKE_WEIGHT"][0]
+GLOBAL_WAKE_WEIGHT = KNOBS["GLOBAL_WAKE_WEIGHT"][0]
+WORKSPACE_WAKE_WEIGHT = KNOBS["WORKSPACE_WAKE_WEIGHT"][0]
 ENTRY_CHARS = KNOBS["ENTRY_CHARS"][0]
 # Every harness truncates a command that prints too much, and each drops a
 # different piece: Claude Code cuts the middle at 30,000 chars, pi cuts the
@@ -158,13 +180,17 @@ def size(k, v, where=""):
     """Validate one knob, wherever it came from: the config file or argv. A
     bad knob stops every command, so the message has to say where it is
     written -- `memo config` cannot fix a file it also refuses to read."""
-    if not v.isdigit() or int(v) < 1:
+    try:
+        value = int(v) if v.isdecimal() else 0
+    except ValueError:
+        value = 0
+    if value < 1:
         die("%s%s must be a positive whole number, not '%s'." % (where, k, v))
     top = min(TREE_REC - 8, LOG_REC - 40)
-    if k == "ENTRY_CHARS" and int(v) > top:
+    if k == "ENTRY_CHARS" and value > top:
         die("%sENTRY_CHARS is at most %d: a memory has to fit the fixed-width "
             "records." % (where, top))
-    return int(v)
+    return value
 
 
 def overrides(d):
@@ -173,35 +199,41 @@ def overrides(d):
     p = os.path.join(d, "config")
     if not os.path.exists(p):
         return out
-    for n, line in enumerate(open(p, encoding="utf-8"), 1):
-        line = line.split("#")[0].strip()
-        if "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        k, v = k.strip().upper(), v.strip()
-        where = "%s line %d: " % (pretty(p), n)
-        if k not in KNOBS:
-            die("%s%s is not a size. Delete the line, or name one of: %s."
-                % (where, k, ", ".join(KNOBS)))
-        out[k] = size(k, v, where)
+    with open(p, encoding="utf-8") as source:
+        for n, line in enumerate(source, 1):
+            line = line.split("#")[0].strip()
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip().upper(), v.strip()
+            where = "%s line %d: " % (pretty(p), n)
+            if k not in KNOBS:
+                die("%s%s is not a size. Delete the line, or name one of: %s."
+                    % (where, k, ", ".join(KNOBS)))
+            out[k] = size(k, v, where)
     return out
 
 
+def config_values(over):
+    values = {k: default for k, (default, _) in KNOBS.items()}
+    values.update(over)
+    return values
+
+
 def config(d):
-    """Apply this memory's overrides. A knob it does not set keeps the tool's
-    default, so updating the tool still changes how it behaves."""
-    for k, v in overrides(d).items():
-        globals()[k] = v  # a knob's name IS the name of the global it sets
+    """Load a complete configuration; overrides must not leak between stores."""
+    globals().update(config_values(overrides(d)))
 
 
 def write_config(d, over):
     """Rewrite `config`: every knob on its own line, commented out unless this
     memory overrides it."""
-    out = ["# OptMem sizes for this memory. A commented line means: follow the",
-           "# tool's default. Edit with `%s config NAME=VALUE`." % ME, ""]
-    for k, (default, what) in KNOBS.items():
-        out.append("%-2s%-12s = %-6d # %s"
-                   % ("" if k in over else "# ", k, over.get(k, default), what))
+    out = ["# OptMem sizes for this memory. A commented line uses the default",
+           "# weights divide WAKE_LINES adaptively. Edit with `%s config NAME=VALUE`." % ME, ""]
+    values = config_values(over)
+    for k, (_, what) in KNOBS.items():
+        out.append("%-2s%-20s = %-6d # %s"
+                   % ("" if k in over else "# ", k, values[k], what))
     with open(os.path.join(d, "config"), "w", encoding="utf-8") as f:
         f.write("\n".join(out) + "\n")
 
@@ -692,7 +724,7 @@ def cmd_nap(d, args):
     print(("\n" if said else "") + nap)
 
 
-def cmd_config(d, args):
+def cmd_config(d, args, scoped=False):
     """Show this memory's sizes, or change one. An empty value restores the
     default. Sizes only select what is printed, so changing one is free: no
     memory is touched and nothing is recomputed."""
@@ -707,10 +739,13 @@ def cmd_config(d, args):
             over[k] = size(k, v.strip())
         else:
             over.pop(k, None)
+    values = config_values(over)
+    if scoped:
+        validate_budget(values["WAKE_LINES"])
     if args:
         write_config(d, over)
     for k, (default, what) in KNOBS.items():
-        print("%-12s %-7d %s%s" % (k, over.get(k, default), what,
+        print("%-20s %-7d %s%s" % (k, values[k], what,
                                    "" if k not in over else
                                    " (default %d)" % default))
 
@@ -788,7 +823,8 @@ def cmd_import(d, args):
     if len(args) != 1:
         die("usage: %s import <file>   # lines of 'YYYY-MM-DD <text>'" % ME)
     try:
-        src = open(args[0], encoding="utf-8").readlines()
+        with open(args[0], encoding="utf-8") as source:
+            src = source.readlines()
     except UnicodeDecodeError:
         die("%s is not UTF-8 text. Convert it, then import again."
             % pretty(args[0]))
@@ -828,31 +864,623 @@ COMMANDS = {"init": cmd_init, "wake": cmd_wake, "note": cmd_note,
             "forget": cmd_forget, "config": cmd_config, "import": cmd_import}
 
 
-def main():
-    usage = __doc__.strip().format(memo=ME)
-    if len(sys.argv) < 2:
-        print(usage)
-        sys.exit(0)
-    cmd = sys.argv[1]
-    if cmd not in COMMANDS:
-        print("No such command: %s\n" % cmd, file=sys.stderr)
-        print(usage, file=sys.stderr)
-        sys.exit(1)
+SCOPES = ("user", "global", "workspace")
+
+
+def canonical(path):
+    return os.path.realpath(os.path.expanduser(path))
+
+
+def read_json(path):
     try:
-        # `init` is the only command that may run without an existing memory:
-        # it is the one that creates it. Every other command refuses, so a
-        # typo in MEMORY_DIR is an error instead of a second, empty identity.
+        with open(path, encoding="utf-8") as f:
+            value = json.load(f)
+    except (ValueError, UnicodeError):
+        die("Invalid JSON in %s." % pretty(path))
+    if not isinstance(value, dict):
+        die("Expected a JSON object in %s." % pretty(path))
+    return value
+
+
+def write_json(path, value):
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=parent,
+                                         prefix=".memo-", delete=False) as f:
+            name = f.name
+            json.dump(value, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(name, path)
+    finally:
+        if name and os.path.exists(name):
+            os.unlink(name)
+
+
+def root_dir(explicit=None):
+    if explicit:
+        return canonical(explicit)
+    if os.environ.get("MEMORY_DIR"):
+        return canonical(os.environ["MEMORY_DIR"])
+    settings = os.path.expanduser("~/.optmem/config.json")
+    if os.path.exists(settings):
+        path = read_json(settings).get("memory_dir")
+        if not isinstance(path, str) or not path.strip() or not os.path.isabs(path):
+            die("Invalid memory_dir in %s: expected an absolute path." % pretty(settings))
+        return canonical(path)
+    return canonical("~/.optmem/memory")
+
+
+def workspace_path(explicit=None):
+    path = canonical(explicit if explicit is not None else os.getcwd())
+    if not os.path.isdir(path):
+        die("Workspace is not a directory: %s." % path)
+    return path
+
+
+def workspace_chunks(path):
+    """Readable, reversible chunks; prefixes separate chunks from the store leaf."""
+    chunks, chunk, size = [], "", 0
+    for char in path:
+        token = char if ord(char) > 127 and char.isprintable() else quote(char, safe="-._ ")
+        width = len(token.encode("utf-8"))
+        if size + width > 253:
+            chunks.append("p-" + chunk)
+            chunk, size = "", 0
+        chunk += token
+        size += width
+    if chunk:
+        chunks.append("p-" + chunk)
+    return chunks
+
+
+def workspace_id(path):
+    # Preserve existing short stores, including their metadata-checked ambiguities.
+    flat = "--" + quote(path.lstrip(os.sep).replace(os.sep, "-"), safe="-._ ") + "--"
+    if len(flat.encode("utf-8")) <= 255:
+        return flat
+    # Flat IDs always start with --; a separate namespace cannot alias one.
+    return os.path.join(".paths", *workspace_chunks(path), "store")
+
+
+class DirectoryPath(str):
+    """Keep a descriptor alive while ordinary store functions use its short path."""
+    def __new__(cls, prefix, fd):
+        path = super().__new__(cls, "%s/%d" % (prefix, fd))
+        # Derived filenames are valid only while this directory owner is retained.
+        path._close = weakref.finalize(path, os.close, fd)
+        return path
+
+
+def workspace_directory(root, identity, creating):
+    """Traverse long centralized paths a component at a time."""
+    if (os.open not in os.supports_dir_fd or os.mkdir not in os.supports_dir_fd
+            or not hasattr(os, "O_DIRECTORY")):
+        die("This platform cannot access this long workspace path safely. "
+            "Select a shorter memory root or workspace path.")
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    fd = os.open(root, flags)
+    try:
+        prefix = next((p for p in ("/proc/self/fd", "/dev/fd")
+                       if os.path.isdir("%s/%d/." % (p, fd))), None)
+        if prefix is None:
+            die("This platform cannot access this long workspace path safely. "
+                "Select a shorter memory root or workspace path.")
+        for component in ["workspaces"] + identity.split(os.sep):
+            if component in ("", ".", ".."):
+                die("Invalid workspace path component.")
+            try:
+                child = os.open(component, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not creating:
+                    return None
+                try:
+                    os.mkdir(component, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                child = os.open(component, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        path = DirectoryPath(prefix, fd)
+        fd = None
+        return path
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def scope_label(scope, workspace):
+    return scope
+
+
+def scope_dir(root, scope, workspace, creating=False):
+    if scope == "workspace":
+        if workspace is None:
+            die("Workspace disabled. Omit --no-workspace or use --workspace PATH.")
+        identity = workspace_id(workspace)
+        path = os.path.join(root, "workspaces", identity)
+        try:
+            path_max = os.pathconf(root, "PC_PATH_MAX") if os.name == "posix" else -1
+        except (OSError, ValueError):
+            path_max = -1
+        if path_max > 0 and len(os.fsencode(path)) + 128 >= path_max:
+            path = workspace_directory(root, identity, creating)
+            if path is None:
+                return None
+    else:
+        path = os.path.join(root, scope)
+    if scope == "workspace" and os.path.exists(path):
+        meta = os.path.join(path, "workspace.json")
+        if os.path.exists(meta):
+            if read_json(meta).get("path") != workspace:
+                die("Workspace ID collision at %s. This directory belongs to another path; "
+                    "no memories were read or changed." % path)
+        elif not creating or (os.path.exists(log_path(path)) and os.path.getsize(log_path(path))):
+            die("Missing workspace metadata at %s; refusing to guess its identity." % path)
+    return path
+
+
+def command_prefix(root, scope=None, workspace=None, pin_workspace=True):
+    args = [os.path.abspath(__file__), "--memory-dir", root]
+    if scope:
+        args += ["--scope", scope]
+    if pin_workspace:
+        args += ["--workspace", workspace] if workspace else ["--no-workspace"]
+    return subprocess.list2cmdline(args) if os.name == "nt" else " ".join(map(shlex.quote, args))
+
+
+@contextlib.contextmanager
+def scope_context(root, scope=None, workspace=None, limits=None):
+    global ME
+    old_me = ME
+    saved = {k: globals()[k] for k in KNOBS}
+    ME = command_prefix(root, scope, workspace)
+    if limits:
+        globals().update(limits)
+    try:
+        yield
+    finally:
+        ME = old_me
+        globals().update(saved)
+
+
+def scoped_text(text, label):
+    text = re.sub(r"(?m)^([ \t]*)#(?=\d)", lambda m: m[1] + label + ":#", text)
+    return re.sub(r"(?m)^Saved as #", "Saved as " + label + ":#", text)
+
+
+def require_root(root, workspace=None):
+    layout = os.path.join(root, "layout.json")
+    if not os.path.isfile(layout):
+        legacy = log_path(root)
+        if os.path.isfile(legacy) and os.path.getsize(legacy):
+            die("Legacy LOG.txt at %s is nonempty. Explicit migration is required; "
+                "it will not be automatically classified." % root)
+        die("No memory at %s (scoped layout not initialized). Initialize with memo init. Run: %s init"
+            % (root, command_prefix(root, pin_workspace=False)))
+    if read_json(layout).get("version") != 2:
+        die("Unsupported memory layout at %s." % root)
+    if os.path.isfile(log_path(root)) and os.path.getsize(log_path(root)):
+        die("Nonempty legacy LOG.txt at %s requires explicit migration." % root)
+
+
+def validate_budget(total):
+    if total < 4:
+        die("WAKE_LINES must be at least 4 for scoped memory (user/global/workspace).")
+
+
+def adaptive_budgets(total, counts, weights):
+    """Weighted water filling between full-history coverage and raw-log capacity."""
+    validate_budget(total)
+    capacity = {s: counts.get(s) or 0 for s in SCOPES}
+    minimum = {s: bin(n).count("1") for s, n in capacity.items()}
+    target = min(total, sum(capacity.values()))
+    required = sum(minimum.values())
+    if required > target:
+        die("WAKE_LINES=%d cannot represent all history: at least %d lines are required. "
+            "Increase WAKE_LINES in the root config, then wake again." % (total, required))
+    if required == target:
+        return minimum
+
+    def shares(level):
+        return {s: min(capacity[s], max(minimum[s], level * weights[s])) for s in SCOPES}
+
+    # The sum is linear between adjacent lower/upper-bound breakpoints.
+    levels = sorted({Fraction(bound[s], weights[s])
+                     for bound in (minimum, capacity) for s in SCOPES})
+    previous, used = Fraction(0), required
+    for level in levels:
+        next_used = sum(shares(level).values())
+        if next_used >= target:
+            level = previous + (level - previous) * Fraction(target - used, next_used - used)
+            exact = shares(level)
+            allocated = {s: int(exact[s]) for s in SCOPES}
+            order = sorted(SCOPES, key=lambda s: exact[s] - allocated[s], reverse=True)
+            for scope in order[:target - sum(allocated.values())]:
+                allocated[scope] += 1
+            return allocated
+        previous, used = level, next_used
+    raise AssertionError("Adaptive budget exceeds available capacity")
+
+
+def init_scopes(root, persist=False):
+    if os.path.exists(root) and not os.path.isdir(root):
+        die("%s: Not a directory." % root)
+    layout = os.path.join(root, "layout.json")
+    fresh = not os.path.exists(layout)
+    if os.path.isfile(log_path(root)) and os.path.getsize(log_path(root)):
+        die("Legacy LOG.txt at %s is nonempty. Explicit migration is required; "
+            "no memories have been moved or reclassified." % root)
+    os.makedirs(root, exist_ok=True)
+    with locked(root):
+        if os.path.exists(layout) and read_json(layout).get("version") != 2:
+            die("Unsupported memory layout at %s." % root)
+        if not os.path.exists(os.path.join(root, "config")):
+            write_config(root, {})
+        config(root)
+        validate_budget(WAKE_LINES)
+        paths = [(scope, scope_dir(root, scope, None, creating=True))
+                 for scope in ("user", "global")]
+        for scope, path in paths:
+            os.makedirs(os.path.join(path, "TREE"), exist_ok=True)
+            with open(log_path(path), "a"):
+                pass
+        write_json(layout, {"version": 2})
+    if persist:
+        settings = os.path.expanduser("~/.optmem/config.json")
+        values = read_json(settings) if os.path.exists(settings) else {}
+        values["memory_dir"] = root
+        write_json(settings, values)
+    print(("Created " if fresh else "Found ") + pretty(root) + ": scoped personal memories.")
+    print("Wake budget: %d lines; weights user=%d, global=%d, workspace=%d."
+          % (WAKE_LINES, USER_WAKE_WEIGHT, GLOBAL_WAKE_WEIGHT, WORKSPACE_WAKE_WEIGHT))
+    print("Initialized user/global only. Wake creates the current directory workspace when needed.")
+    print("No AGENTS.md was written. Optional integration prompt:\n")
+    print(SCOPED_TEMPLATE.format(memo=command_prefix(root, pin_workspace=False), data=pretty(root), chars=ENTRY_CHARS))
+
+
+def ensure_workspace(root, workspace):
+    with locked(root):
+        path = scope_dir(root, "workspace", workspace, creating=True)
+        os.makedirs(os.path.join(path, "TREE"), exist_ok=True)
+        meta = os.path.join(path, "workspace.json")
+        if not os.path.exists(meta):
+            write_json(meta, {"path": workspace})
+        with open(log_path(path), "a"):
+            pass
+    return path
+
+
+def available_scopes(root, selected, workspace, reading=False, create_workspace=False):
+    out = []
+    for scope in selected:
+        if scope == "workspace" and workspace is None:
+            if reading:
+                out.append((scope, None))
+                continue
+            die("Workspace disabled. Omit --no-workspace or use --workspace PATH.")
+        path = (ensure_workspace(root, workspace) if create_workspace and scope == "workspace"
+                else scope_dir(root, scope, workspace))
+        if path is None or not os.path.isfile(log_path(path)) or not os.path.isdir(os.path.join(path, "TREE")):
+            if reading and scope == "workspace":
+                out.append((scope, None))
+                continue
+            command = (command_prefix(root, scope, workspace) + " wake" if scope == "workspace"
+                       else command_prefix(root, pin_workspace=False) + " init")
+            die("Scope %s is not initialized. Run: %s" % (scope, command))
+        out.append((scope, path))
+    return out
+
+
+def wake_scope_lines(root, scope, workspace, path, count_, budget, retry_scope=None):
+    label, lines = scope_label(scope, workspace), []
+    with scope_context(root, scope, workspace):
+        blocks = cover(count_, budget)
+        if len(blocks) > budget:
+            die("[%s] The %d-line budget cannot represent this log without losing history. "
+                "Increase WAKE_LINES in the root config, then wake again." % (label, budget))
+        for lo, hi in blocks:
+            if hi - lo == 1:
+                lines.append(label + ":#%d %s %s" % log_get(path, lo))
+            else:
+                summary = tree_get(path, lo, hi)
+                if summary is None:
+                    nap = next_nap(path, count_)
+                    if nap:
+                        print("[%s] Cannot wake: #%d-%d is not compressed yet.\n%s"
+                              % (label, lo, hi - 1, scoped_text(nap, label)))
+                        die("Complete the scoped compression, then run: %s wake"
+                            % command_prefix(root, retry_scope, workspace))
+                    summary = tree_get(path, lo, hi)
+                if summary is None:
+                    die("[%s] Blank summary #%d-%d. Run: %s forget %d-%d"
+                        % (label, lo, hi - 1, ME, lo, hi - 1))
+                lines.append(label + ":#%d-%d %s" % (lo, hi - 1, summary))
+    return lines
+
+
+def encode_snapshot(state):
+    return base64.urlsafe_b64encode(json.dumps(state, separators=(",", ":")).encode()).decode()
+
+
+def decode_snapshot(token):
+    try:
+        state = json.loads(base64.b64decode(token, altchars=b"-_", validate=True).decode())
+        if not isinstance(state, dict):
+            raise ValueError()
+        return state
+    except (ValueError, UnicodeError):
+        die("Invalid wake snapshot. Run wake again without --snapshot.")
+
+
+def wake_parts(lines, header, prefix, token):
+    """Budget the complete output, including its pinned continuation command."""
+    def fits(body):
+        return (sum(len((line + "\n").splitlines()) for line in body) <= PART_LINES
+                and sum(len(line.encode("utf-8")) + 1 for line in body) <= PART_CHARS)
+
+    if fits([header] + lines + ["You are awake."]):
+        return [lines]
+    bound = len(lines)
+    overhead = [header, "Your scoped memory, part %d of %d." % (bound, bound),
+                "Not awake yet.", "Run: %s wake %d --snapshot %s" % (prefix, bound + 1, token)]
+    parts, current = [], []
+    for line in lines:
+        if not fits(overhead + [line]):
+            die("PART_CHARS or PART_LINES is too small for wake content and its continuation command. "
+                "Increase the paging limits in the root config, then wake again.")
+        if not fits(overhead + current + [line]):
+            parts.append(current)
+            current = []
+        current.append(line)
+    if current:
+        parts.append(current)
+    return parts
+
+
+def scoped_wake(root, selected, workspace, args, token):
+    part = 1
+    if args:
+        try:
+            part = int(args[0]) if len(args) == 1 and args[0].isdecimal() else 0
+        except ValueError:
+            part = 0
+    if part < 1:
+        die("usage: memo wake [part] [--snapshot TOKEN] [--scope SCOPE]")
+    if not token and part != 1:
+        die("Continuing wake requires --snapshot from the previous part.")
+    old = decode_snapshot(token) if token else None
+    stores = available_scopes(root, selected, workspace, reading=True,
+                              create_workspace=not token)
+    limits = {k: globals()[k] for k in KNOBS}
+    state = {"version": 3, "root": root, "workspace": workspace, "scopes": selected,
+             "counts": {s: log_len(p) if p else None for s, p in stores}, "limits": limits}
+    if token:
+        if any(old.get(k) != state[k] for k in ("version", "root", "workspace", "scopes")):
+            die("Wake snapshot belongs to a different root, scope, or workspace.")
+        if old.get("limits") != limits:
+            die("Wake snapshot budgets or paging limits changed. Run wake again.")
+        counts, saved_limits = old.get("counts"), old.get("limits")
+        if (not isinstance(counts, dict) or set(counts) != set(selected)
+                or not isinstance(saved_limits, dict) or set(saved_limits) != set(KNOBS)):
+            die("Invalid wake snapshot contents.")
+        for key, value in saved_limits.items():
+            if type(value) is not int:
+                die("Invalid wake snapshot limits.")
+            size(key, str(value))
+        for scope, path in stores:
+            n = counts[scope]
+            if n is not None and (type(n) is not int or n < 0 or path is None or n > log_len(path)):
+                die("Wake snapshot no longer matches the log. Run wake again.")
+            if n is None and scope != "workspace":
+                die("Invalid wake snapshot counts.")
+        state = old
+        limits = saved_limits
+    weights = {s: limits[s.upper() + "_WAKE_WEIGHT"] for s in SCOPES}
+    quota = adaptive_budgets(limits["WAKE_LINES"], state["counts"], weights)
+    if token:
+        saved = state.get("allocation")
+        if (not isinstance(saved, dict) or set(saved) != set(SCOPES)
+                or any(type(v) is not int for v in saved.values()) or saved != quota):
+            die("Invalid wake snapshot allocation. Run wake again without --snapshot.")
+    state["allocation"] = quota
+    lines = []
+    with scope_context(root, workspace=workspace, limits=limits):
+        for scope, path in stores:
+            n = state["counts"][scope]
+            if n is None:
+                lines.append("[workspace] Disabled or unavailable in this snapshot; skipped.")
+            elif n == 0:
+                lines.append("[%s] No memories yet." % scope_label(scope, workspace))
+            else:
+                lines += wake_scope_lines(root, scope, workspace, path, n, quota[scope],
+                                          retry_scope=selected[0] if len(selected) == 1 else None)
+        if not token:
+            state["tasks"] = []
+            for scope, path in stores:
+                n = state["counts"][scope]
+                todo = pending(path, n, limit=1) if n else []
+                if todo:
+                    lo, hi = todo[0]
+                    state["tasks"].append([scope, lo, hi, max(0, pending_count(path, n) - 1)])
+        tasks = state.get("tasks")
+        if not isinstance(tasks, list) or len(tasks) > len(stores):
+            die("Invalid wake snapshot compression tasks.")
+        seen, paths = set(), dict(stores)
+        for task in tasks:
+            if not isinstance(task, list) or len(task) != 4:
+                die("Invalid wake snapshot compression task.")
+            scope, lo, hi, left = task
+            if (not isinstance(scope, str) or scope not in selected or scope in seen
+                    or any(type(v) is not int for v in (lo, hi, left))
+                    or lo < 0 or hi <= lo + 1 or (hi - lo) & (hi - lo - 1)
+                    or lo % (hi - lo) or not state["counts"][scope]
+                    or hi > state["counts"][scope] or left < 0 or left >= state["counts"][scope]):
+                die("Invalid wake snapshot compression task.")
+            seen.add(scope)
+            with scope_context(root, scope, workspace):
+                nap = nap_prompt(paths[scope], lo, hi, left)
+                lines += ["", "[%s]" % scope_label(scope, workspace)]
+                lines += scoped_text(nap, scope_label(scope, workspace)).split("\n")
+        digest = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+        if token and state.get("digest") != digest:
+            die("Wake snapshot contents changed. Run wake again without --snapshot.")
+        state["digest"] = digest
+        prefix = command_prefix(root, selected[0] if len(selected) == 1 else None, workspace)
+        snapshot = token or encode_snapshot(state)
+        header = ("Wake budgets: user=%d, global=%d, workspace=%d (total %d/%d)."
+                  % (quota["user"], quota["global"], quota["workspace"], sum(quota.values()), limits["WAKE_LINES"]))
+        parts = wake_parts(lines, header, prefix, snapshot)
+        if part > len(parts):
+            die("No part %d: the memory has %s." % (part, plural(len(parts), "part")))
+        print(header)
+        if len(parts) > 1:
+            print("Your scoped memory, part %d of %d." % (part, len(parts)))
+        print("\n".join(parts[part - 1]))
+        if part < len(parts):
+            print("Not awake yet.\nRun: %s wake %d --snapshot %s"
+                  % (prefix, part + 1, snapshot))
+        else:
+            print("You are awake.")
+
+
+def scoped_recall(root, stores, workspace, args):
+    if len(args) != 1:
+        die("usage: memo recall <regex> [--scope SCOPE]")
+    try:
+        pattern = re.compile(args[0], re.I)
+    except re.error as e:
+        die("bad regex: %s" % e)
+    from heapq import heappop, heappush
+
+    def matches(scope, path):
+        order, label = SCOPES.index(scope), scope_label(scope, workspace)
+        for entry in log_scan(path):
+            raw = "#%d %s %s" % entry
+            if pattern.search(raw):
+                yield entry[1], order, entry[0], label + ":" + raw
+
+    streams = []
+    for scope, path in stores:
+        if path is None:
+            print("[workspace] Not initialized or disabled; skipped. Run wake to create it.")
+            continue
+        streams.append(matches(scope, path))
+    hits, out, used, discarded = 0, [], 0, None
+    # Notes can follow future-dated imports or a clock rollback. Select by date,
+    # not append order; never refill gaps with hits older than an evicted match.
+    for stream in streams:
+        for date, order, ident, line in stream:
+            hits += 1
+            length = len(line.encode()) + 1
+            key = (date, order, ident)
+            if length > PART_CHARS or (discarded is not None and key <= discarded):
+                continue
+            heappush(out, (date, order, ident, line, length))
+            used += length
+            while used > PART_CHARS:
+                oldest = heappop(out)
+                used -= oldest[4]
+                discarded = oldest[:3]
+    if not hits:
+        print("No match.")
+    else:
+        # Preserve scope/id display order after selecting by global recency.
+        print("\n".join(item[3] for item in sorted(out, key=lambda item: item[1:3])))
+        print("%d of %d matches shown. Narrow the regex." % (len(out), hits)
+              if len(out) < hits else plural(hits, "match") + ".")
+
+
+SCOPED_TEMPLATE = """## Memory
+
+Your memory is OptMem:
+- The tool is: {memo}
+- Your centralized memories are in {data}.
+- Scopes: `user` for the user's preferences and background, `global` for reusable knowledge, `workspace` for the current directory.
+
+Run {memo} wake before any other tool call, in every session, to read the memory.
+Follow scoped compression and paging commands when needed.
+Wake shares WAKE_LINES (default 96 content lines) adaptively using root-config
+USER_WAKE_WEIGHT, GLOBAL_WAKE_WEIGHT, and WORKSPACE_WAKE_WEIGHT (defaults 1/1/2).
+Unused shares go to other selected scopes; fewer total memories means fewer lines.
+A scoped wake spends the budget only on that scope. Other workspaces are not read.
+
+Call {memo} note --scope SCOPE "<1 line, max {chars} bytes>"
+when something worth keeping happens. Select exactly one SCOPE: user, global, or workspace.
+Ask the user with `ask_user_question` before every `memo note`, and record only what the user approves.
+Do not register redundant memories. Do not edit or delete memory files manually.
+
+Use {memo} recall <regex> to search every memory, word for word.
+Use {memo} zoom --scope SCOPE <lo>-<hi> to open a summary in its own scope.
+Workspace defaults to the current directory; --workspace PATH overrides it.
+Wake creates a missing workspace centrally. Init initializes only user and global.
+
+Subagents must never run memo. When spawning one, say: You are a subagent. Don't run memo.
+"""
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.strip().format(memo=ME),
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--scope", choices=SCOPES)
+    workspace_group = parser.add_mutually_exclusive_group()
+    workspace_group.add_argument("--workspace")
+    workspace_group.add_argument("--no-workspace", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--memory-dir")
+    parser.add_argument("--snapshot")
+    parser.add_argument("command", choices=COMMANDS, nargs="?")
+    parser.add_argument("args", nargs="*")
+    opts = parser.parse_intermixed_args()
+    if opts.command is None:
+        parser.print_help()
+        return
+    root = None
+    try:
+        cmd = opts.command
+        root = root_dir(opts.memory_dir)
+        workspace = None if cmd == "init" or opts.no_workspace else workspace_path(opts.workspace)
+        if opts.snapshot and cmd != "wake":
+            die("--snapshot is only valid for wake.")
         if cmd == "init":
-            cmd_init(memory_dir(), sys.argv[2:])
+            if opts.scope or opts.args or opts.workspace:
+                die("init initializes user/global only. Use memo init [--memory-dir PATH]; "
+                    "use wake --workspace PATH to create a workspace.")
+            with scope_context(root):
+                init_scopes(root, persist=bool(opts.memory_dir))
             return
-        d = store()
-        config(d)
-        COMMANDS[cmd](d, sys.argv[2:])
+        require_root(root, workspace)
+        if cmd == "config":
+            if opts.scope:
+                die("config applies to the centralized root; omit --scope.")
+            with scope_context(root):
+                cmd_config(root, opts.args, scoped=True)
+            return
+        config(root)
+        validate_budget(WAKE_LINES)
+        if cmd in ("note", "nap", "zoom", "forget", "import") and not opts.scope:
+            die("%s requires --scope user|global|workspace; no default write scope." % cmd)
+        selected = [opts.scope] if opts.scope else list(SCOPES)
+        if cmd == "wake":
+            scoped_wake(root, selected, workspace, opts.args, opts.snapshot)
+            return
+        stores = available_scopes(root, selected, workspace, reading=cmd == "recall")
+        if cmd == "recall":
+            scoped_recall(root, stores, workspace, opts.args)
+        else:
+            scope, path = stores[0]
+            label = scope_label(scope, workspace)
+            out = io.StringIO()
+            try:
+                with scope_context(root, scope, workspace), contextlib.redirect_stdout(out):
+                    COMMANDS[cmd](path, opts.args)
+            finally:
+                print("[%s]" % label)
+                print(scoped_text(out.getvalue(), label), end="")
     except OSError as e:
-        # The filesystem is the one thing the tool does not control. Report it
-        # the way every other failure is reported: a Python traceback tells an
-        # agent nothing it can act on.
-        die("%s: %s." % (pretty(e.filename or memory_dir()), e.strerror or e))
+        die("%s: %s." % (pretty(e.filename or root or memory_dir()), e.strerror or e))
 
 
 if __name__ == "__main__":

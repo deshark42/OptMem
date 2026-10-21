@@ -17,6 +17,8 @@ from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 MEMO = os.path.join(HERE, "memo")
+tempfile.tempdir = os.path.expanduser("~/tmp/OptMem")
+os.makedirs(tempfile.tempdir, exist_ok=True)
 cli = SourceFileLoader("memo_cli", MEMO).load_module()
 cover = cli.cover
 
@@ -133,14 +135,19 @@ def offered(out):
 
 
 # the real entry point still has to work: shebang, argv parsing, exit code
-smoke = subprocess.run(memo + ["wake"], env=dict(os.environ, MEMORY_DIR=d),
+cli_home = tempfile.mkdtemp(prefix="optmem-cli-home-")
+cli_root = tempfile.mkdtemp(prefix="optmem-cli-root-")
+cli_env = dict(os.environ, HOME=cli_home, MEMORY_DIR=cli_root)
+cli_init = subprocess.run(memo + ["init"], env=cli_env, capture_output=True, text=True)
+check(cli_init.returncode == 0, "CLI fixture init failed: " + cli_init.stderr)
+smoke = subprocess.run(memo + ["wake", "--scope", "user"], env=cli_env,
                        capture_output=True, text=True)
 check(smoke.returncode == 0 and "No memories yet" in smoke.stdout,
       "the memo CLI does not run: " + smoke.stdout + smoke.stderr)
 
 # a typo in MEMORY_DIR must not silently open a second, empty identity
 ghost = subprocess.run(memo + ["wake"], capture_output=True, text=True,
-                       env=dict(os.environ, MEMORY_DIR=d + "-typo"))
+                       env=dict(cli_env, MEMORY_DIR=d + "-typo"))
 check(ghost.returncode == 1 and "No memory at" in ghost.stderr,
       "a missing MEMORY_DIR was created instead of reported")
 check(not os.path.exists(d + "-typo"), "a missing MEMORY_DIR was created")
@@ -167,9 +174,9 @@ check(woke.returncode == 0 and "You are awake." in woke.stdout,
 # `curl | sh` puts nothing on PATH, so a bare `memo nap ...` would not: the
 # whole loop (note -> merge prompt -> nap) dies on `command not found`.
 bare = dict(fresh, PATH="/usr/bin:/bin")
-subprocess.run(memo + ["note", "the first thing that happened"], env=bare,
+subprocess.run(memo + ["note", "the first thing that happened", "--scope", "user"], env=bare,
                capture_output=True)
-asked = subprocess.run(memo + ["note", "the second thing that happened"],
+asked = subprocess.run(memo + ["note", "the second thing that happened", "--scope", "user"],
                        env=bare, capture_output=True, text=True)
 order = [l[5:] for l in asked.stdout.splitlines() if l.startswith("Run: ")]
 check(len(order) == 1, "note did not order a compression: " + asked.stdout)
@@ -449,10 +456,13 @@ check("Narrow the regex" in r.stdout, "recall did not say it had been capped")
 
 # ---- concurrency and crash recovery ----------------------------------
 
-d2 = tempfile.mkdtemp(prefix="optmem-race-")
-env2 = dict(os.environ, MEMORY_DIR=d2)
+d2_root = tempfile.mkdtemp(prefix="optmem-race-")
+env2 = dict(cli_env, MEMORY_DIR=d2_root)
+r_ = subprocess.run(memo + ["init"], env=env2, capture_output=True, text=True)
+check(r_.returncode == 0, "race fixture init failed: " + r_.stderr)
+d2 = os.path.join(d2_root, "user")
 P = 16  # real processes: this is the cross-process lock under test
-procs = [subprocess.Popen(memo + ["note", "parallel note %d" % i], env=env2,
+procs = [subprocess.Popen(memo + ["note", "parallel note %d" % i, "--scope", "user"], env=env2,
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
          for i in range(P)]
 for p in procs:
@@ -491,7 +501,11 @@ check(r.stdout.rstrip().endswith("You are awake."),
 
 # a blank summary record (a corrupt write) is work nap cannot see: wake must
 # name the one exit, `forget`, instead of refusing forever
-d3 = tempfile.mkdtemp(prefix="optmem-blank-")
+d3_root = tempfile.mkdtemp(prefix="optmem-blank-")
+r_ = subprocess.run(memo + ["init"], env=dict(cli_env, MEMORY_DIR=d3_root),
+                    capture_output=True, text=True)
+check(r_.returncode == 0, "blank fixture init failed: " + r_.stderr)
+d3 = os.path.join(d3_root, "user")
 for i in range(4):
     run("note", "corrupt store memory %d" % i, store=d3)
 for bid, s in (("0-1", "one"), ("2-3", "two"), ("0-3", "all")):
@@ -507,9 +521,14 @@ check(r.returncode == 1 and "forget 0-1" in r.stderr
 
 # an unreadable level is a filesystem failure and must surface as one --
 # reading it as "not compressed yet" offers work that cannot be done
+# Exceed the adaptive raw-log budget so wake still needs this summary level.
+for i in range(4, 8):
+    run("note", "corrupt store memory %d" % i, store=d3)
 os.chmod(os.path.join(d3, "TREE", "2"), 0)
-r_ = subprocess.run(memo + ["wake"], capture_output=True, text=True,
-                    env=dict(os.environ, MEMORY_DIR=d3))
+with open(os.path.join(d3_root, "config"), "w") as f:
+    f.write("WAKE_LINES = 4\n")
+r_ = subprocess.run(memo + ["wake", "--scope", "user"], capture_output=True, text=True,
+                    env=dict(cli_env, MEMORY_DIR=d3_root))
 check(r_.returncode == 1 and "Permission denied" in r_.stderr
       and "not compressed" not in r_.stdout,
       "an unreadable level was read as pending work: " + r_.stdout + r_.stderr)
@@ -522,7 +541,7 @@ with open(os.path.join(d3, "bad.txt"), "w") as f:
 r = run("import", os.path.join(d3, "bad.txt"), store=d3)
 check(r.returncode == 1 and "not a real date" in r.stderr,
       "import accepted an impossible date: " + r.stdout + r.stderr)
-shutil.rmtree(d3)
+shutil.rmtree(d3_root)
 
 # the same blank-record dead end at the other site: a big block's half
 d4 = tempfile.mkdtemp(prefix="optmem-half-")
@@ -542,10 +561,14 @@ shutil.rmtree(d4)
 
 # the store is UTF-8 whatever the locale says: without pinning the streams,
 # one arrow in a memory made wake crash forever on a latin-1 machine
-d5 = tempfile.mkdtemp(prefix="optmem-utf8-")
+d5_root = tempfile.mkdtemp(prefix="optmem-utf8-")
+r_ = subprocess.run(memo + ["init"], env=dict(cli_env, MEMORY_DIR=d5_root),
+                    capture_output=True, text=True)
+check(r_.returncode == 0, "locale fixture init failed: " + r_.stderr)
+d5 = os.path.join(d5_root, "user")
 run("note", "an arrow \u2192 survives any locale", store=d5)
-r_ = subprocess.run(memo + ["wake"], capture_output=True,
-                    env=dict(os.environ, MEMORY_DIR=d5,
+r_ = subprocess.run(memo + ["wake", "--scope", "user"], capture_output=True,
+                    env=dict(cli_env, MEMORY_DIR=d5_root,
                              PYTHONIOENCODING="latin-1"))
 check(r_.returncode == 0 and "\u2192".encode() in r_.stdout,
       "wake must print UTF-8 on a non-UTF-8 locale: "
@@ -568,7 +591,7 @@ with open(os.path.join(d5, "TREE", "2"), "r+b") as f:
 r = run("zoom", "0-3", store=d5)
 check(r.returncode == 1 and "forget 0-1" in r.stderr,
       "a corrupt summary must point at forget: " + r.stdout + r.stderr)
-shutil.rmtree(d5)
+shutil.rmtree(d5_root)
 
 # re-running init on a lived-in store must not touch one byte of it: the
 # whole setup is idempotent, so it is safe on every provision. `init` only
@@ -608,7 +631,10 @@ check(fingerprint(d) == before, "init modified an existing memory")
 r = run("wake")
 check(r.stdout.rstrip().endswith("You are awake."), "wake broke after re-init")
 
-shutil.rmtree(d2)
+shutil.rmtree(d2_root)
+shutil.rmtree(cli_root)
+shutil.rmtree(cli_home)
+shutil.rmtree(fresh["HOME"])
 shutil.rmtree(d)
 print("\n%d passed, %d failed" % (ok, fail))
 sys.exit(1 if fail else 0)

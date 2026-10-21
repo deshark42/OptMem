@@ -1,7 +1,7 @@
 #!/bin/sh
-# OptMem installer. Run it again to update: it only replaces the tool, and
-# `memo init` never touches memories that already exist.
+# OptMem installer. Run it again to update the tool without replacing memories.
 #
+#   sh ./install.sh [options for memo init]
 #   curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/install.sh | sh
 
 set -e
@@ -13,9 +13,21 @@ command -v python3 >/dev/null || {
   exit 1
 }
 
+SOURCE=
+if [ -f "$0" ]; then
+  SCRIPT_DIR=$(CDPATH= cd -P "$(dirname "$0")" && pwd)
+  if [ -f "$SCRIPT_DIR/memo" ]; then
+    SOURCE="$SCRIPT_DIR/memo"
+  fi
+fi
+
 mkdir -p "$DIR"
-curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/memo -o "$DIR/memo.new"
+if [ -n "$SOURCE" ]; then
+  cp "$SOURCE" "$DIR/memo.new"
+else
+  curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/memo -o "$DIR/memo.new"
+fi
 mv "$DIR/memo.new" "$DIR/memo"
 chmod +x "$DIR/memo"
 
-exec "$DIR/memo" init
+exec "$DIR/memo" init "$@"

@@ -1,8 +1,8 @@
 # OptMem
 
-Permanent memory for AI agents. A 426-token prompt, a script, plug and play.
+Permanent memory for AI agents. A prompt, a script, plug and play.
 
-![how OptMem works](anim/optmem.gif)
+![how OptMem works](<anim/optmem.gif>)
 
 ## Install
 
@@ -16,16 +16,26 @@ update.
 
 The tool lands at `~/.optmem/memo`; put `~/.optmem` on `PATH` to type `memo`.
 
+Memory has three scopes, all personal and stored locally:
+- `user`: the user's preferences and background, across workspaces.
+- `global`: reusable knowledge, across workspaces.
+- `workspace`: context for the current directory.
+
 ## Commands
 
 | | |
 |---|---|
+| `memo init` | initialize user and global memory |
 | `memo wake` | read the memory — the first command of every session |
-| `memo note "..."` | record one memory: one line, up to 280 bytes |
-| `memo nap` | answer the merges that came due |
-| `memo recall <regex>` | search every memory ever recorded, word for word |
-| `memo zoom <lo>-<hi>` | open a tree node into its two halves |
-| `memo forget <lo>-<hi>` | drop a bad summary; the next nap rebuilds it |
+| `memo note --scope SCOPE "..."` | record one memory: one line, up to 280 bytes |
+| `memo nap --scope SCOPE` | answer the merges that came due |
+| `memo recall <regex>` | search every memory in the active scopes, word for word |
+| `memo zoom --scope SCOPE <lo>-<hi>` | open a tree node into its two halves |
+| `memo forget --scope SCOPE <lo>-<hi>` | drop a bad summary; the next nap rebuilds it |
+
+`SCOPE` is `user`, `global`, or `workspace`. `wake` and `recall` read user, global,
+and the current workspace by default; add `--scope SCOPE` to read just one.
+`wake` creates a missing workspace. Use `--workspace PATH` to select another directory.
 
 Merges arrive one at a time, in the output of `note`. Nothing ever runs in the
 background.
@@ -36,23 +46,31 @@ background.
 ~/.optmem/
   memo          the tool: one file of Python 3, no dependencies
   memory/
-    LOG.txt     every memory, one per line, append-only, never edited
-    TREE/       the summaries: a cache, rebuildable from the log alone
     config      the sizes, written by `memo config`
+    user/       LOG.txt and TREE/ for user memories
+    global/     LOG.txt and TREE/ for global memories
+    workspaces/<path-id>/  LOG.txt and TREE/ for each workspace
 ```
+
+Each scope has its own `LOG.txt` (every memory, one per line, append-only, never
+edited) and `TREE/` (the summaries: a cache, rebuildable from the log alone).
 
 ```sh
 memo config                  # show the sizes
-memo config WAKE_LINES=300   # how many lines wake prints (96 ≈ 8k tokens)
+memo config WAKE_LINES=300   # total reading budget (default: 96 lines)
 memo config WAKE_LINES=      # back to the default
 ```
 
-`WAKE_LINES` is the only size worth touching, and it is a reading budget, not
+`WAKE_LINES` is a reading budget, not
 a storage budget: change it whenever, in either direction, and nothing is
 recomputed.
 
+The scopes share the budget with weights 1:1:2; unused shares go to scopes that
+can use them. Set `USER_WAKE_WEIGHT`, `GLOBAL_WAKE_WEIGHT`, or
+`WORKSPACE_WAKE_WEIGHT` with `memo config` to change the weights.
+
 Records are fixed width, so position *is* identity and every lookup is one
-seek. At a million memories (608 MB), `wake` takes 0.03s.
+seek.
 
 Set `$MEMORY_DIR` to keep `memory/` elsewhere — a synced folder, a git repo.
 
@@ -66,6 +84,7 @@ This is what the installer prints, and the whole of the integration.
 Your memory is OptMem:
 - The tool is `memo`
 - Your memories are in `~/.optmem/memory`
+- Scopes: `user` for the user's preferences and background, `global` for reusable knowledge, `workspace` for the current directory.
 
 ### At startup: activating OptMem (mandatory)
 
@@ -73,7 +92,7 @@ Run `memo wake` before any other tool call, in every session, to read the memory
 
 ### While working: register memories (mandatory)
 
-Call `memo note "<1 line, max 280 bytes>"` whenever you learn something new, or something worth keeping happens. That covers a task worth real effort, a fact or insight the user teaches you, anything you learn about the user's life (even indirectly), any event of lasting effect.
+Call `memo note --scope SCOPE "<1 line, max 280 bytes>"` whenever you learn something new, or something worth keeping happens. That covers a task worth real effort, a fact or insight the user teaches you, anything you learn about the user's life (even indirectly), any event of lasting effect.
 
 Ask the user with `ask_user_question` before every `memo note`, and record only what the user approves.
 
@@ -87,7 +106,7 @@ Never edit or delete anything under `~/.optmem/memory`: the tool manages it.
 
 `memo recall <regex>` searches every memory, word for word.
 
-Your memories also form a binary tree: #0-1, #2-3 ... exist as one-line summaries, pairs of those as #0-3, and so on -- every `#a-b` line wake prints is one node of it. `memo zoom <a-b>` opens a node into its two halves, down to the raw memories.
+Your memories also form a binary tree: #0-1, #2-3 ... exist as one-line summaries, pairs of those as #0-3, and so on -- every `#a-b` line wake prints is one node of it. `memo zoom --scope SCOPE <a-b>` opens a node into its two halves, down to the raw memories.
 
 ### If you're a subagent: skip everything above
 
