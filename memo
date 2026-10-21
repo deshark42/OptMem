@@ -1410,6 +1410,7 @@ A scoped wake spends the budget only on that scope. Other workspaces are not rea
 
 Call {memo} note --scope SCOPE "<1 line, max {chars} bytes>"
 when something worth keeping happens. Select exactly one SCOPE: user, global, or workspace.
+Start each note with one short topic in square brackets, e.g. `[Git] ...`. Reuse existing topics when possible.
 Ask the user with `ask_user_question` before every `memo note`, and record only what the user approves.
 Do not register redundant memories. Do not edit or delete memory files manually.
 

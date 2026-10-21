@@ -94,6 +94,8 @@ Run `memo wake` before any other tool call, in every session, to read the memory
 
 Call `memo note --scope SCOPE "<1 line, max 280 bytes>"` whenever you learn something new, or something worth keeping happens. That covers a task worth real effort, a fact or insight the user teaches you, anything you learn about the user's life (even indirectly), any event of lasting effect.
 
+Start each note with one short topic in square brackets, e.g. `[Git] ...`. Reuse existing topics when possible.
+
 Ask the user with `ask_user_question` before every `memo note`, and record only what the user approves.
 
 Do not register redundant memories.
