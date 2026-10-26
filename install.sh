@@ -2,7 +2,7 @@
 # OptMem installer. Run it again to update the tool without replacing memories.
 #
 #   sh ./install.sh [options for memo init]
-#   curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/deshark42/OptMem/main/install.sh | sh
 
 set -e
 DIR="$HOME/.optmem"
@@ -25,7 +25,7 @@ mkdir -p "$DIR"
 if [ -n "$SOURCE" ]; then
   cp "$SOURCE" "$DIR/memo.new"
 else
-  curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/memo -o "$DIR/memo.new"
+  curl -fsSL https://raw.githubusercontent.com/deshark42/OptMem/main/memo -o "$DIR/memo.new"
 fi
 mv "$DIR/memo.new" "$DIR/memo"
 chmod +x "$DIR/memo"
